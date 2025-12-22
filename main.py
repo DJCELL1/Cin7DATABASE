@@ -360,6 +360,22 @@ async def get_stats():
     finally:
         db.close()
 
+@app.post("/reset-database")
+async def reset_database():
+    """Drop and recreate the products table"""
+    try:
+        # Drop the table
+        Product.__table__.drop(engine, checkfirst=True)
+        # Recreate it with the new schema
+        Product.__table__.create(engine)
+        
+        return {
+            "status": "success",
+            "message": "Database table reset successfully. Run /sync?full=true to repopulate."
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
