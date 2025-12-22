@@ -36,8 +36,8 @@ class Product(Base):
     __tablename__ = "products"
     
     id = Column(Integer, primary_key=True)
-    cin7_id = Column(String, unique=True, index=True)
-    sku = Column(String, index=True)
+    cin7_id = Column(String, index=True)
+    sku = Column(String, unique=True, index=True)
     name = Column(String, index=True)
     description = Column(Text)
     price = Column(Float)
@@ -138,11 +138,13 @@ def sync_products(db: Session, modified_since: Optional[datetime] = None):
                 if not option_code:
                     continue
                     
+                # Use SKU as unique identifier since multiple options can have same cin7_id
                 product = db.query(Product).filter(Product.sku == option_code).first()
                 
                 if not product:
-                    product = Product(cin7_id=str(product_data.get('id')))
+                    product = Product()
                 
+                product.cin7_id = str(product_data.get('id'))
                 product.sku = option_code
                 product.name = f"{product_data.get('name', '')} - {option.get('option1', '')} {option.get('option2', '')} {option.get('option3', '')}".strip()
                 product.description = product_data.get('description', '')
@@ -163,12 +165,17 @@ def sync_products(db: Session, modified_since: Optional[datetime] = None):
                 synced_count += 1
         else:
             # No options, just save the parent product
-            product = db.query(Product).filter(Product.cin7_id == str(product_data.get('id'))).first()
+            style_code = product_data.get('styleCode', '')
+            if not style_code:
+                continue
+                
+            product = db.query(Product).filter(Product.sku == style_code).first()
             
             if not product:
-                product = Product(cin7_id=str(product_data.get('id')))
+                product = Product()
             
-            product.sku = product_data.get('styleCode', '')
+            product.cin7_id = str(product_data.get('id'))
+            product.sku = style_code
             product.name = product_data.get('name', '')
             product.description = product_data.get('description', '')
             product.price = 0
