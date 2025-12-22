@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from typing import Optional, List
 import logging
 import base64
+import time
 
 # Load environment variables
 load_dotenv()
@@ -109,6 +110,9 @@ class Cin7Client:
                 break
             
             page += 1
+            
+            # Rate limiting: 3 requests per second = 0.34 seconds between requests
+            time.sleep(0.4)
         
         logger.info(f"Fetched {len(all_products)} products from Cin7")
         return all_products
