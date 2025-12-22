@@ -1,29 +1,3 @@
-# Cin7 Product Sync API with FastAPI + PostgreSQL
-
-## Setup Instructions
-
-### 1. Install dependencies
-```bash
-pip install fastapi uvicorn sqlalchemy psycopg2-binary requests python-dotenv apscheduler
-```
-
-### 2. Create .env file with your Cin7 credentials
-```
-CIN7_API_KEY=your_api_key_here
-CIN7_ACCOUNT_ID=your_account_id_here
-DATABASE_URL=postgresql://user:password@localhost/cin7_products
-```
-
-### 3. Run the app
-```bash
-python main.py
-```
-
----
-
-## File: main.py
-
-```python
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, Index
@@ -69,11 +43,6 @@ class Product(Base):
     category = Column(String)
     last_modified = Column(DateTime)
     synced_at = Column(DateTime, default=datetime.utcnow)
-    
-    # Add text search index for name and description
-    __table_args__ = (
-        Index('ix_product_search', 'name', 'sku', postgresql_using='gin', postgresql_ops={'name': 'gin_trgm_ops', 'sku': 'gin_trgm_ops'}),
-    )
 
 # Create tables
 Base.metadata.create_all(bind=engine)
@@ -100,7 +69,6 @@ class Cin7Client:
         }
         
         if modified_since:
-            # Format: 2024-01-01T00:00:00
             params["modifiedSince"] = modified_since.strftime("%Y-%m-%dT%H:%M:%S")
         
         try:
@@ -150,13 +118,11 @@ def sync_products(db: Session, modified_since: Optional[datetime] = None):
     
     synced_count = 0
     for product_data in products:
-        # Map Cin7 product fields to our model
         product = db.query(Product).filter(Product.cin7_id == str(product_data.get('id'))).first()
         
         if not product:
             product = Product(cin7_id=str(product_data.get('id')))
         
-        # Update product fields
         product.sku = product_data.get('code', '')
         product.name = product_data.get('name', '')
         product.description = product_data.get('description', '')
@@ -164,7 +130,6 @@ def sync_products(db: Session, modified_since: Optional[datetime] = None):
         product.stock_on_hand = int(product_data.get('stockOnHand', 0) or 0)
         product.category = product_data.get('category', '')
         
-        # Parse last modified date
         modified_str = product_data.get('modifiedDate') or product_data.get('createdDate')
         if modified_str:
             try:
@@ -193,11 +158,9 @@ def run_sync_job():
     try:
         last_sync = get_last_sync_time(db)
         if last_sync:
-            # Sync products modified since last sync (with 1 min buffer)
             modified_since = last_sync - timedelta(minutes=1)
             sync_products(db, modified_since=modified_since)
         else:
-            # First sync - get everything
             sync_products(db)
     except Exception as e:
         logger.error(f"Error in sync job: {e}")
@@ -242,7 +205,6 @@ async def search_products(
     """Search products by name or SKU"""
     db = SessionLocal()
     try:
-        # Search in name and SKU fields
         products = db.query(Product).filter(
             (Product.name.ilike(f"%{q}%")) | (Product.sku.ilike(f"%{q}%"))
         ).limit(limit).all()
@@ -341,7 +303,7 @@ async def get_stats():
         return {
             "total_products": total_products,
             "last_sync": last_sync,
-            "database_url": DATABASE_URL.split('@')[-1]  # Hide credentials
+            "database_url": DATABASE_URL.split('@')[-1]
         }
     finally:
         db.close()
@@ -349,86 +311,3 @@ async def get_stats():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-```
-
----
-
-## File: requirements.txt
-
-```
-fastapi==0.104.1
-uvicorn==0.24.0
-sqlalchemy==2.0.23
-psycopg2-binary==2.9.9
-requests==2.31.0
-python-dotenv==1.0.0
-apscheduler==3.10.4
-```
-
----
-
-## File: Procfile
-
-```
-web: uvicorn main:app --host 0.0.0.0 --port $PORT
-```
-
----
-
-## File: .gitignore
-
-```
-.env
-__pycache__/
-*.pyc
-*.pyo
-venv/
-.DS_Store
-```
-
----
-
-## Usage Examples
-
-Once running, you can:
-
-**Search for products:**
-```bash
-curl "http://localhost:8000/products/search?q=widget&limit=10"
-```
-
-**Get product by SKU:**
-```bash
-curl "http://localhost:8000/products/sku/ABC123"
-```
-
-**Trigger manual sync:**
-```bash
-curl -X POST "http://localhost:8000/sync"
-```
-
-**Get stats:**
-```bash
-curl "http://localhost:8000/stats"
-```
-
-**Full sync (first time):**
-```bash
-curl -X POST "http://localhost:8000/sync?full=true"
-```
-
----
-
-## How It Works
-
-1. **Initial Setup**: Run `/sync?full=true` to pull all 60k products
-2. **Auto-sync**: Every 15 minutes, fetches only products modified since last sync
-3. **Fast Lookups**: All searches hit PostgreSQL (milliseconds) instead of Cin7 API (seconds)
-4. **Fresh Data**: New products appear within 15 minutes max, or trigger manual sync
-
-## Notes
-
-- Adjust the sync interval in the scheduler (currently 15 minutes)
-- The Cin7 API fields may differ - check their docs and adjust the mapping in `sync_products()`
-- Add indexes on other fields if you need to search by them
-- For production, add proper error handling, retry logic, and monitoring
