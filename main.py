@@ -128,29 +128,64 @@ def sync_products(db: Session, modified_since: Optional[datetime] = None):
     
     synced_count = 0
     for product_data in products:
-        product = db.query(Product).filter(Product.cin7_id == str(product_data.get('id'))).first()
+        # Get product options (variants/SKUs)
+        product_options = product_data.get('productOptions', [])
         
-        if not product:
-            product = Product(cin7_id=str(product_data.get('id')))
-        
-        product.sku = product_data.get('code', '')
-        product.name = product_data.get('name', '')
-        product.description = product_data.get('description', '')
-        product.price = float(product_data.get('price', 0) or 0)
-        product.stock_on_hand = int(product_data.get('stockOnHand', 0) or 0)
-        product.category = product_data.get('category', '')
-        
-        modified_str = product_data.get('modifiedDate') or product_data.get('createdDate')
-        if modified_str:
-            try:
-                product.last_modified = datetime.fromisoformat(modified_str.replace('Z', '+00:00'))
-            except:
-                product.last_modified = datetime.utcnow()
-        
-        product.synced_at = datetime.utcnow()
-        
-        db.add(product)
-        synced_count += 1
+        # If there are product options, create a record for each one
+        if product_options:
+            for option in product_options:
+                option_code = option.get('code', '')
+                if not option_code:
+                    continue
+                    
+                product = db.query(Product).filter(Product.sku == option_code).first()
+                
+                if not product:
+                    product = Product(cin7_id=str(product_data.get('id')))
+                
+                product.sku = option_code
+                product.name = f"{product_data.get('name', '')} - {option.get('option1', '')} {option.get('option2', '')} {option.get('option3', '')}".strip()
+                product.description = product_data.get('description', '')
+                product.price = float(option.get('retailPrice', 0) or 0)
+                product.stock_on_hand = int(option.get('stockOnHand', 0) or 0)
+                product.category = product_data.get('category', '')
+                
+                modified_str = option.get('modifiedDate') or product_data.get('modifiedDate') or product_data.get('createdDate')
+                if modified_str:
+                    try:
+                        product.last_modified = datetime.fromisoformat(modified_str.replace('Z', '+00:00'))
+                    except:
+                        product.last_modified = datetime.utcnow()
+                
+                product.synced_at = datetime.utcnow()
+                
+                db.add(product)
+                synced_count += 1
+        else:
+            # No options, just save the parent product
+            product = db.query(Product).filter(Product.cin7_id == str(product_data.get('id'))).first()
+            
+            if not product:
+                product = Product(cin7_id=str(product_data.get('id')))
+            
+            product.sku = product_data.get('styleCode', '')
+            product.name = product_data.get('name', '')
+            product.description = product_data.get('description', '')
+            product.price = 0
+            product.stock_on_hand = 0
+            product.category = product_data.get('category', '')
+            
+            modified_str = product_data.get('modifiedDate') or product_data.get('createdDate')
+            if modified_str:
+                try:
+                    product.last_modified = datetime.fromisoformat(modified_str.replace('Z', '+00:00'))
+                except:
+                    product.last_modified = datetime.utcnow()
+            
+            product.synced_at = datetime.utcnow()
+            
+            db.add(product)
+            synced_count += 1
     
     db.commit()
     logger.info(f"Synced {synced_count} products to database")
