@@ -10,6 +10,7 @@ import os
 from dotenv import load_dotenv
 from typing import Optional, List
 import logging
+import base64
 
 # Load environment variables
 load_dotenv()
@@ -25,8 +26,8 @@ SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
 # Cin7 API configuration
+CIN7_API_USERNAME = os.getenv("CIN7_API_USERNAME")
 CIN7_API_KEY = os.getenv("CIN7_API_KEY")
-CIN7_ACCOUNT_ID = os.getenv("CIN7_ACCOUNT_ID")
 CIN7_BASE_URL = "https://api.cin7.com/api/v1"
 
 # Product model
@@ -53,11 +54,16 @@ app = FastAPI(title="Cin7 Product Sync API", version="1.0.0")
 # Cin7 API client
 class Cin7Client:
     def __init__(self):
+        self.username = CIN7_API_USERNAME
         self.api_key = CIN7_API_KEY
-        self.account_id = CIN7_ACCOUNT_ID
         self.base_url = CIN7_BASE_URL
+        
+        # Create Basic Auth header
+        credentials = f"{self.username}:{self.api_key}"
+        encoded_credentials = base64.b64encode(credentials.encode()).decode()
+        
         self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Basic {encoded_credentials}",
             "Content-Type": "application/json"
         }
     
