@@ -1,11 +1,11 @@
-from fastapi import FastAPI, HTTPException, Query, Depends
+from fastapi import FastAPI, HTTPException, Query, Depends, Header
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, Index
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import requests
 import os
 from dotenv import load_dotenv
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any, List
 import logging
 import base64
 import time
@@ -14,7 +14,6 @@ import time
 # ENV + LOGGING
 # ---------------------------------------------------------
 load_dotenv()
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cin7_cache_api")
 
@@ -28,22 +27,21 @@ Base = declarative_base()
 
 
 def utcnow() -> datetime:
-    # Keep it timezone-aware to avoid annoying comparisons later
     return datetime.now(timezone.utc)
 
 
 def normalize_sku(s: str) -> str:
+    # Important: keep slash as slash; just normalize case/whitespace.
     return (s or "").strip().upper()
 
 
 def parse_cin7_dt(dt_str: Optional[str]) -> Optional[datetime]:
     """
-    Cin7 often returns ISO strings with 'Z'. Convert safely to aware datetime (UTC).
+    Cin7 often returns ISO strings with 'Z'. Convert to tz-aware UTC safely.
     """
     if not dt_str:
         return None
     try:
-        # Handle "Z" suffix
         cleaned = dt_str.replace("Z", "+00:00")
         dt = datetime.fromisoformat(cleaned)
         if dt.tzinfo is None:
@@ -51,6 +49,14 @@ def parse_cin7_dt(dt_str: Optional[str]) -> Optional[datetime]:
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------
@@ -61,7 +67,7 @@ class Product(Base):
 
     id = Column(Integer, primary_key=True)
     cin7_id = Column(String, index=True)
-    sku = Column(String, unique=True, index=True)  # cache key
+    sku = Column(String, unique=True, index=True)
     name = Column(String, index=True)
     description = Column(Text)
     price = Column(Float)
@@ -73,13 +79,14 @@ class Product(Base):
     __table_args__ = (
         Index("ix_products_sku", "sku"),
         Index("ix_products_name", "name"),
+        Index("ix_products_cin7_id", "cin7_id"),
     )
 
 
 class SyncWatermark(Base):
     """
-    Stores the last time we asked Cin7 for changes.
-    One-row table. This is the key to not re-walking 77k SKUs every sync.
+    One-row table:
+    last_checked = the last time we asked Cin7 for changes.
     """
     __tablename__ = "sync_watermark"
 
@@ -93,15 +100,18 @@ Base.metadata.create_all(bind=engine)
 # ---------------------------------------------------------
 # FASTAPI APP
 # ---------------------------------------------------------
-app = FastAPI(title="Cin7 Product Cache API", version="2.0.0")
+app = FastAPI(title="Cin7 Product Cache API (Manual + Add-Only)", version="3.0.0")
 
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# ---------------------------------------------------------
+# OPTIONAL: SIMPLE INTERNAL API KEY PROTECTION FOR /sync
+# If you don't want protection, leave INTERNAL_API_KEY unset in Railway variables.
+# Then /sync will work without a header.
+# ---------------------------------------------------------
+def require_internal_key(x_api_key: Optional[str] = Header(default=None)):
+    expected = os.getenv("INTERNAL_API_KEY")
+    if expected:
+        if x_api_key != expected:
+            raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 # ---------------------------------------------------------
@@ -116,6 +126,7 @@ class Cin7Client:
     def __init__(self):
         if not CIN7_API_USERNAME or not CIN7_API_KEY:
             logger.warning("Cin7 credentials not set (CIN7_API_USERNAME / CIN7_API_KEY).")
+
         credentials = f"{CIN7_API_USERNAME}:{CIN7_API_KEY}"
         encoded = base64.b64encode(credentials.encode()).decode()
 
@@ -125,12 +136,16 @@ class Cin7Client:
         }
         self.base_url = CIN7_BASE_URL
 
-    def get_products(self, modified_since: Optional[datetime], page: int = 1, page_size: int = 250) -> List[Dict[str, Any]]:
+    def get_products(
+        self,
+        modified_since: Optional[datetime],
+        page: int = 1,
+        page_size: int = 250,
+    ) -> List[Dict[str, Any]]:
         params = {"page": page, "rows": page_size}
 
         if modified_since:
-            # Cin7 expects e.g. 2026-01-10T02:24:08
-            # Strip timezone info for format consistency, but keep UTC time.
+            # Cin7 expects a naive timestamp string (no timezone), so send UTC naive
             ms = modified_since.astimezone(timezone.utc).replace(tzinfo=None)
             params["modifiedSince"] = ms.strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -143,9 +158,7 @@ class Cin7Client:
             )
             r.raise_for_status()
             data = r.json()
-            if not isinstance(data, list):
-                return []
-            return data
+            return data if isinstance(data, list) else []
         except requests.exceptions.RequestException as e:
             logger.error(f"Error fetching products from Cin7: {e}")
             return []
@@ -156,20 +169,21 @@ class Cin7Client:
         page_size = 250
 
         while True:
-            logger.info(f"Cin7 fetch page={page} modified_since={modified_since.isoformat() if modified_since else 'NONE'}")
+            logger.info(
+                f"Cin7 fetch page={page} modified_since={modified_since.isoformat() if modified_since else 'NONE'}"
+            )
             batch = self.get_products(modified_since=modified_since, page=page, page_size=page_size)
             if not batch:
                 break
 
             all_products.extend(batch)
-
             if len(batch) < page_size:
                 break
 
             page += 1
             time.sleep(0.4)  # basic rate limiting
 
-        logger.info(f"Cin7 returned {len(all_products)} products in this sync window.")
+        logger.info(f"Cin7 returned {len(all_products)} products for this sync window.")
         return all_products
 
 
@@ -182,43 +196,44 @@ def get_watermark(db: Session) -> Optional[SyncWatermark]:
     return db.query(SyncWatermark).order_by(SyncWatermark.id.asc()).first()
 
 
-def set_watermark(db: Session, new_time: datetime) -> SyncWatermark:
+def set_watermark(db: Session, ts: datetime) -> SyncWatermark:
     wm = get_watermark(db)
     if not wm:
-        wm = SyncWatermark(last_checked=new_time, updated_at=utcnow())
+        wm = SyncWatermark(last_checked=ts, updated_at=utcnow())
         db.add(wm)
     else:
-        wm.last_checked = new_time
+        wm.last_checked = ts
         wm.updated_at = utcnow()
     return wm
 
 
 # ---------------------------------------------------------
-# SYNC LOGIC: MANUAL + ADD-ONLY
+# SYNC LOGIC (MANUAL + ADD-ONLY)
 # ---------------------------------------------------------
 def sync_new_products_add_only(db: Session, modified_since: Optional[datetime]) -> Dict[str, int]:
     """
-    Fetch from Cin7 and INSERT ONLY (skip if sku already exists).
-    Returns counts: inserted, skipped_existing, scanned_records
+    Calls Cin7 Products endpoint for changes since watermark,
+    then INSERTS ONLY any SKU not already in DB.
+
+    Returns counts: inserted, skipped_existing, scanned_records, cin7_payload_count
     """
-    products = cin7_client.get_all_products(modified_since=modified_since)
+    payload = cin7_client.get_all_products(modified_since=modified_since)
 
     inserted = 0
     skipped = 0
-    scanned = 0
+    scanned_records = 0
 
-    for product_data in products:
-        scanned += 1
+    for product_data in payload:
+        scanned_records += 1
 
         cin7_id = str(product_data.get("id") or "")
         base_name = product_data.get("name") or ""
         description = product_data.get("description") or ""
         category = product_data.get("category") or ""
 
-        product_options = product_data.get("productOptions") or []
-
-        # Choose a modified timestamp from the payload (best effort)
         parent_mod = parse_cin7_dt(product_data.get("modifiedDate") or product_data.get("createdDate"))
+
+        product_options = product_data.get("productOptions") or []
 
         if product_options:
             for opt in product_options:
@@ -226,7 +241,7 @@ def sync_new_products_add_only(db: Session, modified_since: Optional[datetime]) 
                 if not opt_code:
                     continue
 
-                # add-only: skip if already exists
+                # ADD-ONLY: skip if exists
                 exists = db.query(Product.id).filter(Product.sku == opt_code).first()
                 if exists:
                     skipped += 1
@@ -253,6 +268,7 @@ def sync_new_products_add_only(db: Session, modified_since: Optional[datetime]) 
                 inserted += 1
 
         else:
+            # No options: store parent styleCode as SKU
             style_code = normalize_sku(product_data.get("styleCode"))
             if not style_code:
                 continue
@@ -278,7 +294,12 @@ def sync_new_products_add_only(db: Session, modified_since: Optional[datetime]) 
 
     db.commit()
 
-    return {"inserted": inserted, "skipped_existing": skipped, "scanned_records": scanned}
+    return {
+        "cin7_payload_count": len(payload),
+        "scanned_records": scanned_records,
+        "inserted": inserted,
+        "skipped_existing": skipped,
+    }
 
 
 # ---------------------------------------------------------
@@ -287,10 +308,10 @@ def sync_new_products_add_only(db: Session, modified_since: Optional[datetime]) 
 @app.get("/")
 async def root():
     return {
-        "message": "Cin7 Product Cache API (manual sync, add-only)",
+        "message": "Cin7 Product Cache API (manual sync, add-only, watermark-based incremental fetches)",
         "endpoints": {
             "search": "/products/search?q=query",
-            "get_by_sku": "/products/sku/{sku}",
+            "get_by_sku_query": "/products/by-sku?sku=LP5300/29S",
             "get_by_id": "/products/{cin7_id}",
             "sync_now": "POST /sync",
             "stats": "/stats",
@@ -301,7 +322,7 @@ async def root():
 
 @app.get("/products/search")
 async def search_products(
-    q: str = Query(..., description="Search query for product name or SKU"),
+    q: str = Query(..., description="Search query for product name or SKU (contains match)"),
     limit: int = Query(50, le=500, description="Maximum results to return"),
     db: Session = Depends(get_db),
 ):
@@ -330,8 +351,11 @@ async def search_products(
     ]
 
 
-@app.get("/products/sku/{sku}")
-async def get_product_by_sku(sku: str, db: Session = Depends(get_db)):
+@app.get("/products/by-sku")
+async def get_product_by_sku_query(
+    sku: str = Query(..., description="Exact SKU lookup (supports slashes like LP5300/29S)"),
+    db: Session = Depends(get_db),
+):
     sku_norm = normalize_sku(sku)
     product = db.query(Product).filter(Product.sku == sku_norm).first()
     if not product:
@@ -380,13 +404,14 @@ async def watermark(db: Session = Depends(get_db)):
 
 @app.post("/sync")
 async def trigger_sync(
-    full: bool = Query(False, description="If true, ignore watermark and scan Cin7 from scratch (still add-only inserts)."),
+    full: bool = Query(False, description="If true, ignores watermark (expensive). Still add-only."),
     db: Session = Depends(get_db),
+    _: None = Depends(require_internal_key),  # only enforced if INTERNAL_API_KEY is set
 ):
     """
-    Manual sync only. Add-only cache.
-    - If full=false: uses watermark to fetch only changes since last manual sync
-    - If full=true: fetches without modifiedSince (can be expensive)
+    Manual sync only:
+    - full=false: fetch changes since watermark (cheap)
+    - full=true: fetch everything (expensive), but still only inserts missing SKUs
     """
     try:
         wm = get_watermark(db)
@@ -394,7 +419,7 @@ async def trigger_sync(
 
         stats = sync_new_products_add_only(db, modified_since=modified_since)
 
-        # Update watermark only after a successful sync
+        # Update watermark only after successful sync
         set_watermark(db, utcnow())
         db.commit()
 
@@ -424,8 +449,8 @@ async def get_stats(db: Session = Depends(get_db)):
 @app.post("/reset-database")
 async def reset_database():
     """
-    Drops and recreates tables.
-    WARNING: This wipes your cache (and your watermark).
+    Drops and recreates tables (wipes cache + watermark).
+    Use only if you're okay rebuilding the cache.
     """
     try:
         Product.__table__.drop(engine, checkfirst=True)
@@ -436,7 +461,7 @@ async def reset_database():
 
         return {
             "status": "success",
-            "message": "Database reset. Next /sync (incremental) will behave like first run; /sync?full=true will rebuild cache.",
+            "message": "Database reset. Next /sync (incremental) will behave like first run; /sync?full=true will rebuild cache (expensive).",
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
